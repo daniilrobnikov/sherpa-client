@@ -8,58 +8,15 @@ export default function Home() {
   const [recognitionText, setRecognitionText] = useState<string[]>([]);
   const [serverIp, setServerIp] = useState<string>("");
   const [serverPort, setServerPort] = useState<string>("");
-  const [results, setResults] = useState<string>("");
   const [isRecording, setIsRecording] = useState<boolean>(false);
-  const [socket, setSocket] = useState<WebSocket | null>(null);
 
-  // const [audioCtx, setAudioCtx] = useState<AudioContext | null>(null);
-  // const [recordSampleRate, setRecordSampleRate] = useState<number>(0);
-  // const [leftChannel, setLeftChannel] = useState<Int16Array[]>([]);
-  // const [recordingLength, setRecordingLength] = useState<number>(0);
+  const [socket, setSocket] = useState<WebSocket | null>(null);
+  const [microphone, setMicrophone] = useState<MediaStream | null>(null);
+  const [audioContext, setAudioContext] = useState<AudioContext | null>(null);
+  const [recorder, setRecorder] = useState<AudioWorkletNode | null>(null);
+  const [source, setSource] = useState<MediaStreamAudioSourceNode | null>(null);
 
   const textArea = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    if (socket == null) return;
-
-    // Connection opened
-    socket.onopen = function () {
-      console.log("connected");
-      setIsRecording(true);
-    };
-
-    // Connection closed
-    socket.onclose = function () {
-      console.log("disconnected");
-      setIsRecording(false);
-    };
-
-    // Listen for messages
-    socket.onmessage = function (event) {
-      let message = JSON.parse(event.data);
-      if (message.segment in recognitionText) {
-        recognitionText[message.segment] = message.text;
-      } else {
-        recognitionText.push(message.text);
-      }
-      textArea.current!.value = getDisplayResult();
-      textArea.current!.scrollTop = textArea.current!.scrollHeight; // auto scroll
-
-      console.log("Received message: ", event.data);
-    };
-
-    socket.onerror = function (event) {
-      console.error("Socket error: ", event);
-    };
-  }, [socket]);
-
-  useEffect(() => {
-    if (isRecording) {
-      startRecording();
-    } else {
-      stopRecording();
-    }
-  }, [isRecording]);
 
   function getDisplayResult() {
     let i = 0;
@@ -87,7 +44,40 @@ export default function Home() {
 
     let uri = protocol + server_ip + ":" + server_port;
     console.log("uri", uri);
-    setSocket(new WebSocket(uri));
+
+    const socket = new WebSocket(uri);
+
+    // Connection opened
+    socket.onopen = function () {
+      setIsRecording(true);
+      console.log("connected");
+    };
+
+    // Connection closed
+    socket.onclose = function () {
+      setIsRecording(false);
+      console.log("disconnected");
+    };
+
+    // Listen for messages
+    socket.onmessage = function (event) {
+      let message = JSON.parse(event.data);
+      if (message.segment in recognitionText) {
+        recognitionText[message.segment] = message.text;
+      } else {
+        recognitionText.push(message.text);
+      }
+      textArea.current!.value = getDisplayResult();
+      textArea.current!.scrollTop = textArea.current!.scrollHeight; // auto scroll
+
+      console.log("Received message: ", event.data);
+    };
+
+    socket.onerror = function (event) {
+      console.error("Socket error: ", event);
+    };
+
+    return socket;
   }
 
   function downsampleBuffer(buffer: Float32Array, recordSampleRate: number) {
@@ -117,7 +107,12 @@ export default function Home() {
   }
 
   async function startRecording() {
-    if (socket == null) return;
+    const socket = initWebSocket();
+
+    if (socket == null) {
+      console.log("Failed to create connection to server!");
+      return;
+    }
     if (!navigator.mediaDevices) {
       console.log("getUserMedia not supported on your browser!");
       return;
@@ -137,13 +132,12 @@ export default function Home() {
 
     const recorder = new AudioWorkletNode(context, "recorder.worklet");
 
-    source.connect(recorder).connect(context.destination);
+    source.connect(recorder);
+    recorder.connect(context.destination);
 
     recorder.port.onmessage = (event) => {
       let samples = event.data as Float32Array;
-      console.log("samples: ", samples);
       samples = downsampleBuffer(samples, context.sampleRate);
-      console.log("samples: ", samples);
 
       let buf = new Int16Array(samples.length);
       for (var i = 0; i < samples.length; ++i) {
@@ -162,25 +156,38 @@ export default function Home() {
     };
 
     console.log("recorder started");
+
+    setSocket(socket);
+    setMicrophone(microphone);
+    setAudioContext(context);
+    setRecorder(recorder);
+    setSource(source);
   }
 
   function stopRecording() {
-    console.log("stop recording");
-  }
-
-  function handleStart() {
-    initWebSocket();
-  }
-
-  function handleStop() {
     if (socket == null) return;
-
-    console.log("recorder stopped");
+    if (microphone == null) return;
+    if (audioContext == null) return;
+    if (recorder == null) return;
+    if (source == null) return;
 
     socket.send("Done");
     console.log("Sent Done");
 
     socket.close();
+
+    microphone.getTracks().forEach((track) => track.stop());
+    recorder.port.postMessage("stop");
+
+    recorder.disconnect(audioContext.destination);
+    source.disconnect(recorder);
+    console.log("recorder stopped");
+
+    setSocket(null);
+    setMicrophone(null);
+    setAudioContext(null);
+    setRecorder(null);
+    setSource(null);
   }
 
   return (
@@ -222,8 +229,6 @@ export default function Home() {
           ref={textArea}
           className="flex min-h-[20vh] w-full justify-center border-y border-gray-300 bg-white/30 p-4 backdrop-blur-2xl dark:border-neutral-800 dark:bg-zinc-800/30 dark:from-inherit lg:rounded-xl lg:border"
           placeholder="Recognized text"
-          value={results}
-          onChange={(e) => setResults(e.target.value)}
         />
 
         {/* Copy text button */}
@@ -248,7 +253,7 @@ export default function Home() {
         <button
           type="button"
           className="absolute bottom-0 right-0 m-4 flex justify-center rounded-md bg-blue-500 p-4 text-gray-100 transition-colors hover:bg-blue-600 hover:from-inherit dark:from-inherit dark:invert lg:rounded-lg"
-          onClick={isRecording ? handleStop : handleStart}
+          onClick={isRecording ? stopRecording : startRecording}
         >
           {isRecording ? "Stop recording" : "Start recording"}
         </button>

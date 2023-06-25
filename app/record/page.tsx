@@ -1,7 +1,8 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, forwardRef } from "react";
 import { ToastContainer, toast } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
+import SiriWave from "siriwave";
 
 const sampleRate = 16000;
 
@@ -16,8 +17,212 @@ export default function Home() {
   const [audioContext, setAudioContext] = useState<AudioContext | null>(null);
   const [recorder, setRecorder] = useState<AudioWorkletNode | null>(null);
   const [source, setSource] = useState<MediaStreamAudioSourceNode | null>(null);
+  const [isTopFaded, setIsTopFaded] = useState<boolean>(false);
+  const [isBottomFaded, setIsBottomFaded] = useState<boolean>(false);
 
-  const textArea = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const siriWave = useRef<SiriWave | null>(null);
+
+  // Initialize SiriWave
+  useEffect(() => {
+    siriWave.current = new SiriWave({
+      container: document.getElementById("siri-container")!,
+      width: 640,
+      height: 200,
+      style: "ios9",
+      autostart: true,
+      amplitude: 3,
+      speed: 0.05,
+    });
+  }, []);
+
+  useEffect(() => {
+    let source: MediaStreamAudioSourceNode | null = null;
+    let taskHandle = 0;
+    let spectrum: Uint8Array;
+    let dBASpectrum: Float32Array;
+
+    // A-weighting
+    // https://www.softdb.com/difference-between-db-dba/
+    // https://en.wikipedia.org/wiki/A-weighting
+    const RA = (f: number) =>
+      (12194 ** 2 * f ** 4) /
+      ((f ** 2 + 20.6 ** 2) *
+        Math.sqrt((f ** 2 + 107.7 ** 2) * (f ** 2 + 737.9 ** 2)) *
+        (f ** 2 + 12194 ** 2));
+    const A = (f: number) => 20 * Math.log10(RA(f)) + 2.0;
+
+    // see https://developer.mozilla.org/en-US/docs/Web/API/Web_Audio_API/Visualizations_with_Web_Audio_API
+
+    function run() {
+      const audioStream = navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // Note that the visualisation itself is animated with fps_ani = 60 Hz ↷ interval_ani = 17 msec
+      // ν
+      const approxVisualisationUpdateFrequency = 5;
+      // total sample time T = 1 / ν
+      // sampling rate f
+      // total number of samples N = f ∙ T
+
+      audioStream
+        .then((stream) =>
+          Promise.all([stream, navigator.mediaDevices.enumerateDevices()]),
+        )
+        .then(([stream, devices]) => {
+          let context = new window.AudioContext();
+          //create source for sound input.
+          source = context.createMediaStreamSource(stream);
+          //create analyser node.
+          let analyser = context.createAnalyser();
+
+          const trackSettings = stream.getAudioTracks()[0].getSettings();
+          const sampleRate = trackSettings.sampleRate || context.sampleRate; // Firefox does not support trackSettings.sampleRate
+          const device = devices.find(
+            (device) => device.deviceId === trackSettings.deviceId,
+          );
+          const deviceName = device?.label || "Unknown device";
+
+          console.log(`sample rate: ${sampleRate} Hz, 
+    audio context sample rate: ${context.sampleRate} Hz,
+    dynamic: ${trackSettings.sampleSize} bit
+    device: ${deviceName}`);
+
+          let totalNumberOfSamples =
+            sampleRate / approxVisualisationUpdateFrequency; // e.g. 48000 / 5 = 9600
+
+          analyser.fftSize = 2 ** Math.floor(Math.log2(totalNumberOfSamples));
+
+          const uint8TodB = (byteLevel: number) =>
+            (byteLevel / 255) * (analyser.maxDecibels - analyser.minDecibels) +
+            analyser.minDecibels;
+
+          console.log(`frequency bins: ${analyser.frequencyBinCount}`);
+
+          const weightings = [-100];
+          for (let i = 1; i < analyser.frequencyBinCount; i++) {
+            weightings[i] = A(
+              (i * sampleRate) / 2 / analyser.frequencyBinCount,
+            );
+          }
+
+          //array for frequency data.
+          // holds Number.NEGATIVE_INFINITY, [0 = -100dB, ..., 255 = -30 dB]
+          spectrum = new Uint8Array(analyser.frequencyBinCount);
+          dBASpectrum = new Float32Array(analyser.frequencyBinCount);
+
+          let waveForm = new Uint8Array(analyser.frequencyBinCount);
+
+          //connect source->analyser->destination.
+          source.connect(analyser);
+          // noisy feedback loop if we put the mic on the speakers
+          //analyser.connect(context.destination);
+
+          siriWave.current!.start();
+
+          const updateAnimation = function (idleDeadline: IdleDeadline) {
+            taskHandle = requestIdleCallback(updateAnimation, {
+              timeout: 1000 / approxVisualisationUpdateFrequency,
+            });
+
+            //copy frequency data to spectrum from analyser.
+            // holds Number.NEGATIVE_INFINITY, [0 = -100dB, ..., 255 = -30 dB]
+            analyser.getByteFrequencyData(spectrum);
+
+            spectrum.forEach((byteLevel, idx) => {
+              dBASpectrum[idx] = uint8TodB(byteLevel) + weightings[idx];
+            });
+
+            const highestPerceptibleFrequencyBin = dBASpectrum.reduce(
+                (acc, y, idx) => (y > -90 ? idx : acc),
+                0,
+              ),
+              // S = ∑ s_i
+              totaldBAPower = dBASpectrum.reduce((acc, y) => acc + y),
+              // s⍉ = ∑ s_i ∙ i / ∑ s_i
+              meanFrequencyBin =
+                dBASpectrum.reduce((acc, y, idx) => acc + y * idx) /
+                totaldBAPower,
+              highestPowerBin = dBASpectrum.reduce(
+                ([maxPower, iMax], y, idx) =>
+                  y > maxPower ? [y, idx] : [maxPower, iMax],
+                [-120, 0],
+              )[1],
+              highestDetectedFrequency =
+                highestPerceptibleFrequencyBin *
+                (sampleRate / 2 / analyser.frequencyBinCount),
+              meanFrequency =
+                meanFrequencyBin *
+                (sampleRate / 2 / analyser.frequencyBinCount),
+              maxPowerFrequency =
+                highestPowerBin * (sampleRate / 2 / analyser.frequencyBinCount);
+
+            //set the speed for siriwave
+            // scaled to [0..22kHz] -> [0..1]
+            siriWave.current!.setSpeed(maxPowerFrequency / 10e3);
+
+            const averagedBAPower = totaldBAPower / analyser.frequencyBinCount;
+
+            //find the max amplituded
+            // the zero level is at 128
+            analyser.getByteTimeDomainData(waveForm);
+
+            // find the maximum not considering negative values (without loss of generality)
+            const amplitude =
+              waveForm.reduce((acc, y) => Math.max(acc, y), 128) - 128;
+
+            //scale amplituded from [0, 128] to [0, 10].
+            siriWave.current!.setAmplitude((amplitude / 128) * 10);
+          };
+
+          taskHandle = requestIdleCallback(updateAnimation, {
+            timeout: 1000 / approxVisualisationUpdateFrequency,
+          });
+        });
+    }
+
+    function stop() {
+      cancelIdleCallback(taskHandle);
+      siriWave.current!.setAmplitude(0);
+      siriWave.current!.setSpeed(0);
+      source!.disconnect();
+      siriWave.current!.stop();
+      source!.mediaStream.getAudioTracks()[0].stop();
+    }
+
+    if (isRecording) {
+      run();
+    } else if (!isRecording && source) {
+      stop();
+    }
+  }, [isRecording]);
+
+  // Update isFaded when the scroll position is changed
+  useEffect(() => {
+    textareaRef.current!.onscroll = () => {
+      if (textareaRef.current!.scrollTop > 0) {
+        setIsTopFaded(true);
+      } else {
+        setIsTopFaded(false);
+      }
+      if (
+        textareaRef.current!.scrollHeight -
+          textareaRef.current!.scrollTop -
+          textareaRef.current!.clientHeight >
+        25
+      ) {
+        setIsBottomFaded(true);
+      } else {
+        setIsBottomFaded(false);
+      }
+      if (
+        textareaRef.current!.scrollHeight > textareaRef.current!.clientHeight
+      ) {
+        textareaRef.current!.style.height =
+          textareaRef.current!.scrollHeight + "px";
+      }
+    };
+  }, []);
 
   function getDisplayResult() {
     let i = 0;
@@ -74,8 +279,15 @@ export default function Home() {
       } else {
         recognitionText.push(message.text);
       }
-      textArea.current!.value = getDisplayResult();
-      textArea.current!.scrollTop = textArea.current!.scrollHeight; // auto scroll
+      textareaRef.current!.value = getDisplayResult();
+      if (
+        textareaRef.current!.scrollHeight -
+          textareaRef.current!.scrollTop -
+          textareaRef.current!.clientHeight <
+        25
+      ) {
+        textareaRef.current!.scrollTop = textareaRef.current!.scrollHeight; // auto scroll
+      }
 
       console.log("Received message: ", event.data);
     };
@@ -117,9 +329,11 @@ export default function Home() {
     const socket = initWebSocket();
     console.log("socket", socket);
 
-    if (socket == null || socket.readyState != WebSocket.OPEN) {
+    if (socket == null) {
       console.log("Websocket cannot be accessed");
-      toast.error("Websocket cannot be accessed, please check server or uri");
+      toast.error(
+        "Websocket cannot be connected.\nPlease check the server and uri",
+      );
       return;
     }
     if (!navigator.mediaDevices) {
@@ -194,12 +408,27 @@ export default function Home() {
     source.disconnect(recorder);
     // console.log("recorder stopped");
 
+    siriWave.current!.stop();
+
     setSocket(null);
     setMicrophone(null);
     setAudioContext(null);
     setRecorder(null);
     setSource(null);
   }
+
+  const handleCopy = () => {
+    if (textareaRef.current) {
+      textareaRef.current.select();
+      navigator.clipboard.writeText(textareaRef.current.value);
+    }
+  };
+
+  const handleClear = () => {
+    if (textareaRef.current) {
+      textareaRef.current.value = "";
+    }
+  };
 
   return (
     <>
@@ -226,27 +455,39 @@ export default function Home() {
             onChange={(e) => setServerPort(e.target.value)}
           />
         </div>
-
-        <div className="relative flex place-items-center before:pointer-events-none before:absolute before:h-[300px] before:w-[480px] before:-translate-x-1/2 before:rounded-full before:bg-gradient-radial before:from-white before:to-transparent before:blur-2xl before:content-[''] after:pointer-events-none after:absolute after:-z-20 after:h-[180px] after:w-[240px] after:translate-x-1/3 after:bg-gradient-conic after:from-sky-200 after:via-blue-200 after:blur-2xl after:content-[''] before:dark:bg-gradient-to-br before:dark:from-transparent before:dark:to-blue-700 before:dark:opacity-10 after:dark:from-sky-900 after:dark:via-[#0141ff] after:dark:opacity-40 before:lg:h-[360px]">
+        {/* <div className="relative flex place-items-center before:pointer-events-none before:absolute before:h-[300px] before:w-[480px] before:-translate-x-1/2 before:rounded-full before:bg-gradient-radial before:from-white before:to-transparent before:blur-2xl before:content-[''] after:pointer-events-none after:absolute after:-z-20 after:h-[180px] after:w-[240px] after:translate-x-1/3 after:bg-gradient-conic after:from-sky-200 after:via-blue-200 after:blur-2xl after:content-[''] before:dark:bg-gradient-to-br before:dark:from-transparent before:dark:to-blue-700 before:dark:opacity-10 after:dark:from-sky-900 after:dark:via-[#0141ff] after:dark:opacity-40 before:lg:h-[360px]">
           <h3 className="relative text-center text-3xl font-bold text-gray-900 dark:drop-shadow-[0_0_0.3rem_#ffffff70] dark:invert">
             Recognition from
             <br />
             real-time recordings
           </h3>
-        </div>
-
+        </div> */}
         {/* Textarea with recognized text */}
         <div className="relative w-full max-w-5xl text-sm">
           <textarea
-            ref={textArea}
-            className="flex min-h-[20vh] w-full justify-center border-y border-gray-300 bg-white/30 p-4 backdrop-blur-2xl dark:border-neutral-800 dark:bg-zinc-800/30 dark:from-inherit lg:rounded-xl lg:border"
+            ref={textareaRef}
+            className="flex max-h-[50vh] min-h-[30vh] w-full justify-center border-y border-gray-300 bg-white/30 p-4 backdrop-blur-2xl dark:border-neutral-800 dark:bg-zinc-800/30 dark:from-inherit lg:rounded-xl lg:border"
             placeholder="Recognized text"
+            // readOnly
+          />
+
+          {/* Fade upper part of textarea */}
+          <div
+            className={`pointer-events-none absolute inset-x-[1px] top-[1px] h-24 bg-gradient-to-b from-white dark:from-zinc-800/30 lg:rounded-xl ${
+              isTopFaded ? "opacity-100" : "opacity-0"
+            } transition-opacity duration-300`}
+          />
+          <div
+            className={`pointer-events-none absolute inset-x-[1px] bottom-[1px] h-24 bg-gradient-to-t from-white dark:from-zinc-800/30 lg:rounded-xl ${
+              isBottomFaded ? "opacity-100" : "opacity-0"
+            } transition-opacity duration-300`}
           />
 
           {/* Copy text button */}
           <button
             type="button"
             className="absolute right-0 top-0 m-4 flex h-10 w-10 items-center justify-center rounded-md bg-white fill-gray-500 p-3 transition-colors hover:bg-gray-200 hover:from-inherit dark:bg-zinc-800/30 dark:from-inherit dark:fill-gray-300 dark:hover:bg-zinc-500/30 lg:rounded-lg"
+            onClick={() => handleCopy()}
           >
             <svg
               aria-hidden="true"
@@ -261,6 +502,35 @@ export default function Home() {
             </svg>
           </button>
 
+          {/* Clear text button */}
+          <button
+            type="button"
+            className="absolute right-0 top-14 m-4 flex h-10 w-10 items-center justify-center rounded-md bg-white fill-gray-500 p-3 transition-colors hover:bg-gray-200 hover:from-inherit dark:bg-zinc-800/30 dark:from-inherit dark:fill-gray-300 dark:hover:bg-zinc-500/30 lg:rounded-lg"
+            onClick={() => handleClear()}
+          >
+            <svg
+              aria-hidden="true"
+              height="16"
+              viewBox="0 0 16 16"
+              version="1.1"
+              width="16"
+              data-view-component="true"
+            >
+              {/* Circle */}
+              <path
+                fillRule="evenodd"
+                d="M8 16A8 8 0 108 0a8 8 0 000 16z"
+                clipRule="evenodd"
+              />
+              {/* Cross */}
+              <path
+                fillRule="evenodd"
+                d="M10.828 5.172a.5.5 0 010 .707L8.707 8l2.121 2.121a.5.5 0 11-.707.707L8 8.707l-2.121 2.121a.5.5 0 11-.707-.707L7.293 8 5.172 5.879a.5.5 0 11.707-.707L8 7.293l2.121-2.122a.5.5 0 01.707 0z"
+                clipRule="evenodd"
+              />
+            </svg>
+          </button>
+
           {/* Start record button with text "Start recording" */}
           <button
             type="button"
@@ -270,8 +540,7 @@ export default function Home() {
             {isRecording ? "Stop recording" : "Start recording"}
           </button>
         </div>
-
-        <div className="mb-0 grid text-center lg:grid-cols-4 lg:text-left">
+        {/* <div className="mb-0 grid text-center lg:grid-cols-4 lg:text-left">
           <a
             href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
             className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
@@ -339,7 +608,8 @@ export default function Home() {
               Instantly deploy your Next.js site to a shareable URL with Vercel.
             </p>
           </a>
-        </div>
+        </div> */}
+        <div id="siri-container"></div>
       </main>
       <ToastContainer />
     </>

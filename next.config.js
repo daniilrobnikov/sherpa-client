@@ -1,4 +1,13 @@
 /** @type {import('next').NextConfig} */
-const nextConfig = {}
+// Export output if NODE_ENV is production
 
-module.exports = nextConfig
+const nextConfig = {};
+
+if (process.env.NODE_ENV === "production") {
+  module.exports = {
+    ...nextConfig,
+    output: "export",
+  };
+} else {
+  module.exports = nextConfig;
+}
